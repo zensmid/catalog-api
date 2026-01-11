@@ -26,7 +26,9 @@ def resize_image(image, max_size=MAX_IMAGE_SIZE):
 
 def extract_from_pdf(pdf_file):
     """
-    Extrae imágenes y texto de un PDF de forma optimizada
+    Extrae productos de un catálogo PDF con estructura de tabla
+    Formato esperado:
+    PRODUCTO | FOTO | MODELO | MAYOREO | MITAD CAJA | POR CAJA | CANTIDAD
     """
     products = []
     pdf_document = None
@@ -42,125 +44,139 @@ def extract_from_pdf(pdf_file):
         for page_num in range(total_pages):
             page = pdf_document[page_num]
             
-            # Extraer texto de la página
+            # Extraer texto completo de la página
             text = page.get_text()
+            lines = [l.strip() for l in text.split('\n') if l.strip()]
             
             # Extraer imágenes de la página
             image_list = page.get_images(full=True)
             
-            print(f"📄 Página {page_num + 1}/{total_pages}: {len(image_list)} imágenes")
+            print(f"📄 Página {page_num + 1}/{total_pages}: {len(image_list)} imágenes, {len(lines)} líneas")
             
-            if not image_list:
-                continue
-            
-            # Dividir texto en líneas
-            lines = [l.strip() for l in text.split('\n') if l.strip()]
-            
-            for img_index, img in enumerate(image_list):
-                try:
-                    xref = img[0]
-                    base_image = pdf_document.extract_image(xref)
-                    image_bytes = base_image["image"]
+            # Buscar filas de productos
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+                
+                # Detectar inicio de producto (descripción en mayúsculas o con palabras clave)
+                if len(line) > 5 and (line.isupper() or any(word in line.upper() for word in ['GORRO', 'SET', 'BOLSA', 'IMPERMEABLE', 'TIRA', 'LUCES', 'ESTRELLITAS', 'NAVIDAD', 'AMARILLA'])):
+                    description = line
                     
-                    # Convertir a PIL Image
-                    image = Image.open(io.BytesIO(image_bytes))
-                    
-                    # **OPTIMIZACIÓN 1: Reducir tamaño de imagen**
-                    image = resize_image(image)
-                    
-                    # **OPTIMIZACIÓN 2: Convertir a RGB si es necesario**
-                    if image.mode not in ('RGB', 'L'):
-                        image = image.convert('RGB')
-                    
-                    # Calcular hash de la imagen
-                    img_hash = str(imagehash.phash(image, hash_size=HASH_SIZE))
-                    
-                    # BUSCAR DATOS EN EL TEXTO
-                    sku_pattern = r'(?:SKU[:\s]*)?([A-Z0-9\-]{3,20})'
-                    price_pattern = r'\$?\s*(\d{1,5}\.?\d{0,2})'
-                    
-                    sku = f"PDF-{page_num+1}-{img_index+1}"
-                    description = "Producto sin descripción"
+                    # Buscar los siguientes datos en las próximas 10 líneas
+                    sku = None
                     prices = []
+                    moq = 100
                     
-                    # Buscar en las primeras 50 líneas (optimizar)
-                    for i, line in enumerate(lines[:50]):
-                        sku_matches = re.findall(sku_pattern, line, re.IGNORECASE)
-                        if sku_matches:
-                            for match in sku_matches:
-                                if 4 <= len(match) <= 15:
-                                    sku = match
-                                    break
+                    # Buscar en las siguientes líneas
+                    for j in range(i + 1, min(i + 10, len(lines))):
+                        next_line = lines[j].strip()
                         
-                        price_matches = re.findall(price_pattern, line)
-                        for match in price_matches:
-                            try:
-                                price = float(match.replace(',', ''))
-                                if 1 <= price <= 10000:
-                                    prices.append(price)
-                            except:
-                                pass
+                        # Buscar SKU/Modelo (números o combinaciones alfanuméricas cortas)
+                        if not sku and len(next_line) <= 10 and (next_line.replace('-', '').replace('_', '').isalnum()):
+                            if not next_line.replace(' ', '').isdigit() or len(next_line) <= 4:
+                                sku = next_line
                         
-                        if 15 <= len(line) <= 100:
-                            if not any(c in line for c in ['$', '€', '£', '¢']):
-                                if not line.replace('-', '').replace(' ', '').isdigit():
-                                    description = line[:80]
+                        # Buscar números que sean precios (números entre 10 y 10000)
+                        numbers = re.findall(r'\b(\d{2,5})\b', next_line)
+                        for num_str in numbers:
+                            num = int(num_str)
+                            if 10 <= num <= 10000:
+                                prices.append(num)
+                        
+                        # Buscar MOQ (cantidad)
+                        if 'PIEZA' in next_line.upper() or 'DOCENA' in next_line.upper() or 'CAJITA' in next_line.upper():
+                            moq_match = re.search(r'(\d+)\s*(?:PIEZA|DOCENA|CAJITA)', next_line, re.IGNORECASE)
+                            if moq_match:
+                                moq = int(moq_match.group(1))
+                        
+                        # Si llegamos a otro producto, parar
+                        if j > i + 2 and len(next_line) > 20 and next_line.isupper():
+                            break
                     
-                    # Asignar precios
-                    if prices:
+                    # Asignar SKU si no se encontró
+                    if not sku:
+                        sku = f"PROD-{page_num+1}-{len(products)+1}"
+                    
+                    # Asignar precios (ordenar de menor a mayor)
+                    if len(prices) >= 3:
+                        prices_sorted = sorted(set(prices))[:3]
+                        price_mayoreo = prices_sorted[0]
+                        price_mitad = prices_sorted[1] if len(prices_sorted) > 1 else prices_sorted[0]
+                        price_caja = prices_sorted[2] if len(prices_sorted) > 2 else prices_sorted[0]
+                    elif len(prices) >= 2:
                         prices_sorted = sorted(set(prices))
-                        price_menudeo = prices_sorted[0]
-                        price_caja = prices_sorted[1] if len(prices_sorted) > 1 else price_menudeo * 0.85
+                        price_mayoreo = prices_sorted[0]
+                        price_mitad = prices_sorted[1]
+                        price_caja = prices_sorted[1]
+                    elif len(prices) == 1:
+                        price_mayoreo = prices[0]
+                        price_mitad = prices[0]
+                        price_caja = prices[0]
                     else:
-                        price_menudeo = 50.00
-                        price_caja = 42.50
+                        price_mayoreo = 50
+                        price_mitad = 50
+                        price_caja = 50
                     
                     # Detectar categoría
                     category = 'GENERAL'
-                    text_lower = text.lower()
-                    if any(word in text_lower for word in ['electronic', 'electrónic', 'gadget', 'usb', 'cable']):
+                    desc_lower = description.lower()
+                    if any(word in desc_lower for word in ['gorro', 'bufanda', 'caballero', 'dama', 'niño', 'niña']):
+                        category = 'ROPA Y ACCESORIOS'
+                    elif any(word in desc_lower for word in ['navidad', 'luces', 'estrellitas', 'decoracion']):
+                        category = 'DECORACION'
+                    elif any(word in desc_lower for word in ['bolsa', 'regalo', 'empaque']):
+                        category = 'EMPAQUES Y REGALOS'
+                    elif any(word in desc_lower for word in ['impermeable', 'tira', 'led']):
                         category = 'ELECTRONICA'
-                    elif any(word in text_lower for word in ['accesorio', 'accessory', 'soporte', 'funda']):
-                        category = 'ACCESORIOS'
-                    elif any(word in text_lower for word in ['hogar', 'home', 'cocina', 'kitchen']):
-                        category = 'HOGAR'
-                    elif any(word in text_lower for word in ['deporte', 'sport', 'fitness', 'ejercicio']):
-                        category = 'DEPORTES'
+                    
+                    # Calcular hash de imagen si existe
+                    img_hash = None
+                    if len(products) < len(image_list):
+                        try:
+                            img = image_list[len(products)]
+                            xref = img[0]
+                            base_image = pdf_document.extract_image(xref)
+                            image_bytes = base_image["image"]
+                            image = Image.open(io.BytesIO(image_bytes))
+                            image = resize_image(image)
+                            if image.mode not in ('RGB', 'L'):
+                                image = image.convert('RGB')
+                            img_hash = str(imagehash.phash(image, hash_size=HASH_SIZE))
+                            del image
+                            del image_bytes
+                        except:
+                            pass
                     
                     product = {
                         'sku': sku,
                         'description': description,
-                        'priceMenudeo': round(price_menudeo, 2),
-                        'priceCaja': round(price_caja, 2),
-                        'moq': 100,
+                        'priceMenudeo': round(float(price_mayoreo), 2),
+                        'priceCaja': round(float(price_caja), 2),
+                        'moq': moq,
                         'category': category,
                         'image_hash': img_hash,
                     }
                     
                     products.append(product)
-                    
-                    # **OPTIMIZACIÓN 3: Limpiar imagen de memoria**
-                    del image
-                    del image_bytes
-                    
-                except Exception as e:
-                    print(f"❌ Error en imagen {img_index}: {e}")
-                    continue
+                    print(f"✅ Producto: {description[:30]}... | SKU: {sku} | Precios: {price_mayoreo}/{price_mitad}/{price_caja} | MOQ: {moq}")
+                
+                i += 1
             
-            # **OPTIMIZACIÓN 4: Liberar memoria después de cada página**
+            # **OPTIMIZACIÓN: Liberar memoria**
             del page
-            if page_num % 5 == 0:  # Cada 5 páginas
+            if page_num % 5 == 0:
                 gc.collect()
         
     except Exception as e:
         print(f"❌ Error leyendo PDF: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         if pdf_document:
             pdf_document.close()
-        # **OPTIMIZACIÓN 5: Forzar garbage collection**
         gc.collect()
     
-    print(f"📦 Total productos del PDF: {len(products)}")
+    print(f"📦 Total productos extraídos del PDF: {len(products)}")
     return products
 
 def extract_from_excel(excel_file):
@@ -345,6 +361,45 @@ def consolidate_catalogs():
             max_price = max(prices)
             savings = round(max_price - best['priceCaja'], 2)
             
+            # Generar contenido optimizado para TikTok Shop
+            description_clean = best['description'][:60].strip()
+            
+            # Título optimizado (máx 60 caracteres)
+            optimized_title = f"{description_clean} | {best['category']}"[:60]
+            
+            # Descripción optimizada con emojis y formato TikTok
+            optimized_description = f"""✨ {description_clean}
+
+🎯 CARACTERÍSTICAS:
+• Categoría: {best['category']}
+• MOQ: {best['moq']} piezas
+• Disponible con múltiples proveedores
+
+💰 PRECIO:
+• Menudeo: ${best['priceMenudeo']:.2f}
+• Por Caja: ${best['priceCaja']:.2f}
+
+📦 Envíos disponibles
+✅ Calidad garantizada
+🚀 Entrega rápida"""
+
+            # Hashtags relevantes
+            category_hashtags = {
+                'ROPA Y ACCESORIOS': '#fashion #accesorios #moda #estilo',
+                'DECORACION': '#decoracion #hogar #navidad #luces',
+                'EMPAQUES Y REGALOS': '#regalo #empaque #bolsas #packaging',
+                'ELECTRONICA': '#tech #electronica #gadgets #led',
+                'GENERAL': '#productos #mayoreo #ventas'
+            }
+            
+            base_hashtags = '#tiktokshop #mayoreo #preciosmayoreo #ventasonline'
+            category_specific = category_hashtags.get(best['category'], '#productos')
+            hashtags = f"{base_hashtags} {category_specific}"
+            
+            # Calcular margen sugerido (30-50%)
+            suggested_retail_low = round(best['priceCaja'] * 1.3, 2)
+            suggested_retail_high = round(best['priceCaja'] * 1.5, 2)
+            
             consolidated_product = {
                 'consolidated_sku': f"CONS-{str(len(consolidated) + 1).zfill(4)}",
                 'description': best['description'],
@@ -362,7 +417,13 @@ def consolidate_catalogs():
                         'priceCaja': p['priceCaja']
                     }
                     for p in group
-                ]
+                ],
+                # Campos optimizados para TikTok Shop
+                'optimizedTitle': optimized_title,
+                'optimizedDescription': optimized_description,
+                'hashtags': hashtags,
+                'suggestedRetailPrice': f"${suggested_retail_low:.2f} - ${suggested_retail_high:.2f}",
+                'profitMargin': "30-50%"
             }
             
             consolidated.append(consolidated_product)
