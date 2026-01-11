@@ -287,9 +287,14 @@ def consolidate_catalogs():
         # **OPTIMIZACIÓN 6: Procesar archivo por archivo y limpiar memoria**
         for idx, file in enumerate(files):
             filename = file.filename.lower()
-            provider_name = file.filename.split('.')[0]
             
-            print(f"📄 Procesando archivo {idx+1}/{len(files)}: {file.filename}")
+            # Extraer nombre del proveedor (eliminar _parte1, _parte2, etc)
+            base_name = file.filename.split('.')[0]
+            # Remover _parte, _part, -parte, -part seguido de números
+            import re
+            provider_name = re.sub(r'[_-]?(parte?|part)[_-]?\d+$', '', base_name, flags=re.IGNORECASE)
+            
+            print(f"📄 Procesando archivo {idx+1}/{len(files)}: {file.filename} (Proveedor: {provider_name})")
             
             try:
                 if filename.endswith('.pdf'):
