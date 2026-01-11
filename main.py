@@ -1,177 +1,302 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from openpyxl import load_workbook
-from openpyxl.drawing.image import Image as XLImage
-import imagehash
-from PIL import Image
-import io
-import base64
 import os
+from PIL import Image
+import imagehash
+import io
+import re
+import fitz  # PyMuPDF
+import pytesseract
+from collections import defaultdict
 
 app = Flask(__name__)
-CORS(app)  # Permitir requests desde el frontend
+CORS(app)
+
+# Función para extraer imágenes y texto de PDF
+def extract_from_pdf(pdf_file):
+    """
+    Extrae imágenes y texto de un PDF
+    Retorna lista de productos con imágenes
+    """
+    products = []
+    
+    # Abrir PDF
+    pdf_document = fitz.open(stream=pdf_file.read(), filetype="pdf")
+    
+    for page_num in range(len(pdf_document)):
+        page = pdf_document[page_num]
+        
+        # Extraer texto de la página
+        text = page.get_text()
+        
+        # Extraer imágenes de la página
+        image_list = page.get_images(full=True)
+        
+        print(f"📄 Página {page_num + 1}: {len(image_list)} imágenes encontradas")
+        
+        for img_index, img in enumerate(image_list):
+            try:
+                xref = img[0]
+                base_image = pdf_document.extract_image(xref)
+                image_bytes = base_image["image"]
+                
+                # Convertir a PIL Image
+                image = Image.open(io.BytesIO(image_bytes))
+                
+                # Calcular hash de la imagen
+                img_hash = str(imagehash.phash(image))
+                
+                # Intentar extraer info del texto cercano
+                # Buscar patrones comunes en catálogos
+                
+                # Patrón para SKU (ejemplos: SKU123, ABC-123, 12345)
+                sku_pattern = r'(?:SKU[:\s]*)?([A-Z0-9\-]{4,15})'
+                
+                # Patrón para precios (ejemplos: $123.45, $123, 123.45)
+                price_pattern = r'\$?\s*(\d+\.?\d{0,2})'
+                
+                # Patrón para descripción (texto antes del precio generalmente)
+                lines = text.split('\n')
+                
+                # Buscar datos en el contexto de la imagen
+                sku = f"PDF-{page_num+1}-{img_index+1}"
+                description = f"Producto {page_num+1}-{img_index+1}"
+                prices = []
+                
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    # Buscar SKUs
+                    sku_match = re.search(sku_pattern, line, re.IGNORECASE)
+                    if sku_match and len(sku) < 10:  # Solo si aún no tenemos un SKU bueno
+                        sku = sku_match.group(1)
+                    
+                    # Buscar precios
+                    price_matches = re.findall(price_pattern, line)
+                    for match in price_matches:
+                        try:
+                            price = float(match)
+                            if 1 <= price <= 10000:  # Filtrar precios razonables
+                                prices.append(price)
+                        except:
+                            pass
+                    
+                    # Si la línea tiene 20-100 caracteres, podría ser descripción
+                    if 20 <= len(line) <= 100 and not any(c in line for c in ['$', '€', '£']):
+                        description = line[:80]  # Limitar longitud
+                
+                # Si no encontramos precios, intentar OCR en la imagen
+                if not prices:
+                    try:
+                        ocr_text = pytesseract.image_to_string(image, lang='spa')
+                        ocr_prices = re.findall(price_pattern, ocr_text)
+                        for match in ocr_prices:
+                            try:
+                                price = float(match)
+                                if 1 <= price <= 10000:
+                                    prices.append(price)
+                            except:
+                                pass
+                    except Exception as e:
+                        print(f"⚠️ OCR error: {e}")
+                
+                # Usar el precio más bajo como precio de menudeo, siguiente como caja
+                price_menudeo = min(prices) if prices else 50.00
+                price_caja = prices[1] if len(prices) > 1 else price_menudeo * 0.8
+                
+                product = {
+                    'sku': sku,
+                    'description': description,
+                    'priceMenudeo': round(price_menudeo, 2),
+                    'priceCaja': round(price_caja, 2),
+                    'moq': 100,  # Default
+                    'category': 'GENERAL',  # Default
+                    'image_hash': img_hash,
+                    'image': image
+                }
+                
+                products.append(product)
+                print(f"✓ Producto extraído: {sku} - ${price_menudeo}")
+                
+            except Exception as e:
+                print(f"❌ Error extrayendo imagen {img_index}: {e}")
+                continue
+    
+    pdf_document.close()
+    return products
+
+# Función para procesar archivos Excel (mantener compatibilidad)
+def extract_from_excel(excel_file):
+    """
+    Mantiene la funcionalidad original de Excel
+    """
+    from openpyxl import load_workbook
+    from openpyxl.drawing.image import Image as XLImage
+    
+    products = []
+    
+    try:
+        wb = load_workbook(excel_file, data_only=True)
+        sheet = wb.active
+        
+        # Detectar columnas
+        headers = [cell.value for cell in sheet[1]]
+        
+        col_mapping = {}
+        for idx, header in enumerate(headers, 1):
+            if header:
+                h = str(header).lower()
+                if 'sku' in h or 'codigo' in h:
+                    col_mapping['sku'] = idx
+                elif 'descripcion' in h or 'producto' in h or 'nombre' in h:
+                    col_mapping['description'] = idx
+                elif 'menudeo' in h or 'precio' in h:
+                    col_mapping['price'] = idx
+                elif 'caja' in h or 'mayoreo' in h:
+                    col_mapping['priceCaja'] = idx
+                elif 'moq' in h or 'minimo' in h:
+                    col_mapping['moq'] = idx
+                elif 'categoria' in h or 'category' in h:
+                    col_mapping['category'] = idx
+        
+        # Extraer imágenes
+        for image in sheet._images:
+            try:
+                row = image.anchor._from.row + 1
+                
+                # Leer datos de la fila
+                sku = sheet.cell(row, col_mapping.get('sku', 1)).value or f"XLS-{row}"
+                description = sheet.cell(row, col_mapping.get('description', 2)).value or "Producto sin descripción"
+                price = sheet.cell(row, col_mapping.get('price', 3)).value or 50.00
+                price_caja = sheet.cell(row, col_mapping.get('priceCaja', 4)).value or price * 0.8
+                moq = sheet.cell(row, col_mapping.get('moq', 5)).value or 100
+                category = sheet.cell(row, col_mapping.get('category', 6)).value or "GENERAL"
+                
+                # Convertir imagen
+                img_bytes = image._data()
+                img = Image.open(io.BytesIO(img_bytes))
+                img_hash = str(imagehash.phash(img))
+                
+                product = {
+                    'sku': str(sku),
+                    'description': str(description),
+                    'priceMenudeo': float(price),
+                    'priceCaja': float(price_caja),
+                    'moq': int(moq),
+                    'category': str(category),
+                    'image_hash': img_hash,
+                    'image': img
+                }
+                
+                products.append(product)
+                print(f"✓ Excel: {sku} - ${price}")
+                
+            except Exception as e:
+                print(f"❌ Error en imagen Excel: {e}")
+                continue
+        
+        wb.close()
+        
+    except Exception as e:
+        print(f"❌ Error leyendo Excel: {e}")
+    
+    return products
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok", "message": "API funcionando correctamente"})
+    return jsonify({'status': 'healthy', 'message': 'API funcionando correctamente'}), 200
 
-@app.route('/process-catalogs', methods=['POST'])
-def process_catalogs():
+@app.route('/api/consolidate', methods=['POST'])
+def consolidate_catalogs():
     try:
         if 'files' not in request.files:
-            return jsonify({"error": "No se enviaron archivos"}), 400
+            return jsonify({
+                'success': False,
+                'error': 'No se enviaron archivos'
+            }), 400
         
         files = request.files.getlist('files')
+        
+        if not files:
+            return jsonify({
+                'success': False,
+                'error': 'Lista de archivos vacía'
+            }), 400
+        
+        print(f"📦 Recibidos {len(files)} archivos")
+        
         all_products = []
         
-        # Procesar cada archivo Excel
+        # Procesar cada archivo
         for file in files:
-            provider_name = file.filename.replace('.xlsx', '').replace('.xls', '')
+            filename = file.filename.lower()
+            provider_name = file.filename.split('.')[0]
             
-            # Leer Excel
-            wb = load_workbook(file, data_only=True)
-            ws = wb.active
+            print(f"📄 Procesando: {file.filename}")
             
-            # Extraer imágenes embebidas
-            images_dict = {}
-            if hasattr(ws, '_images'):
-                for img in ws._images:
-                    # Obtener la fila de la imagen
-                    row = img.anchor._from.row if hasattr(img.anchor, '_from') else 0
-                    try:
-                        img_bytes = img._data()
-                        img_pil = Image.open(io.BytesIO(img_bytes))
-                        
-                        # Calcular hash perceptual
-                        phash = str(imagehash.phash(img_pil))
-                        avg_hash = str(imagehash.average_hash(img_pil))
-                        
-                        # Convertir a base64 para enviar al frontend
-                        buffered = io.BytesIO()
-                        img_pil.save(buffered, format="PNG")
-                        img_base64 = base64.b64encode(buffered.getvalue()).decode()
-                        
-                        images_dict[row] = {
-                            'data': img_base64,
-                            'phash': phash,
-                            'avg_hash': avg_hash
-                        }
-                    except Exception as e:
-                        print(f"Error procesando imagen en fila {row}: {e}")
-            
-            # Leer datos de las filas
-            headers = []
-            for cell in ws[1]:
-                headers.append(cell.value.strip().upper() if cell.value else '')
-            
-            # Mapear columnas
-            col_map = {}
-            for idx, header in enumerate(headers):
-                if header in ['CODIGO', 'SKU']:
-                    col_map['sku'] = idx
-                elif header in ['DESCRIPCION', 'PRODUCTO', 'DESCRIPCIÓN']:
-                    col_map['descripcion'] = idx
-                elif header in ['PRECIO_CAJA', 'PRECIO']:
-                    col_map['precio_caja'] = idx
-                elif header in ['PRECIO_MENUDEO', 'MENUDEO']:
-                    col_map['precio_menudeo'] = idx
-                elif header in ['MOQ', 'PZAS_CAJA']:
-                    col_map['moq'] = idx
-                elif header in ['CATEGORIA', 'CATEGORÍA']:
-                    col_map['categoria'] = idx
-            
-            # Extraer productos
-            for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-                if not row or not any(row):
-                    continue
-                
-                product = {
-                    'provider': provider_name,
-                    'sku': row[col_map.get('sku', 0)] if 'sku' in col_map else f'SKU-{row_idx}',
-                    'description': row[col_map.get('descripcion', 1)] if 'descripcion' in col_map else 'Sin descripción',
-                    'priceCaja': float(row[col_map.get('precio_caja', 2)] or 0) if 'precio_caja' in col_map else 0,
-                    'priceMenudeo': float(row[col_map.get('precio_menudeo', 3)] or 0) if 'precio_menudeo' in col_map else 0,
-                    'moq': int(row[col_map.get('moq', 4)] or 100) if 'moq' in col_map else 100,
-                    'category': row[col_map.get('categoria', 5)] if 'categoria' in col_map else 'SIN CATEGORIA',
-                }
-                
-                # Buscar imagen para esta fila
-                img_data = images_dict.get(row_idx, images_dict.get(row_idx - 1, None))
-                if img_data:
-                    product['image'] = img_data['data']
-                    product['phash'] = img_data['phash']
-                    product['avg_hash'] = img_data['avg_hash']
-                else:
-                    product['image'] = None
-                    product['phash'] = None
-                    product['avg_hash'] = None
-                
-                if product['description'] and product['description'] != 'Sin descripción':
-                    all_products.append(product)
-        
-        # Agrupar duplicados usando imagen
-        groups = []
-        processed = set()
-        
-        for i, product in enumerate(all_products):
-            if i in processed:
+            if filename.endswith('.pdf'):
+                # Procesar PDF
+                products = extract_from_pdf(file)
+            elif filename.endswith(('.xlsx', '.xls')):
+                # Procesar Excel
+                products = extract_from_excel(file)
+            else:
+                print(f"⚠️ Formato no soportado: {filename}")
                 continue
             
-            group = [product]
-            processed.add(i)
+            # Añadir nombre de proveedor
+            for product in products:
+                product['provider'] = provider_name
             
-            for j, other in enumerate(all_products):
-                if i == j or j in processed:
-                    continue
-                
-                # Comparar por hash de imagen (si existen)
-                if product.get('phash') and other.get('phash'):
-                    # Calcular distancia Hamming
-                    phash_dist = sum(c1 != c2 for c1, c2 in zip(product['phash'], other['phash']))
-                    avg_dist = sum(c1 != c2 for c1, c2 in zip(product['avg_hash'], other['avg_hash']))
-                    
-                    # Si las imágenes son muy similares (distancia < 8)
-                    if phash_dist < 8 or avg_dist < 8:
-                        group.append(other)
-                        processed.add(j)
-                # Si no hay imagen, comparar por descripción
-                elif product['description'].lower() == other['description'].lower():
-                    group.append(other)
-                    processed.add(j)
-            
-            groups.append(group)
+            all_products.extend(products)
+            print(f"✓ {len(products)} productos de {provider_name}")
         
-        # Consolidar grupos
+        if not all_products:
+            return jsonify({
+                'success': False,
+                'error': 'No se pudieron extraer productos de los archivos'
+            }), 400
+        
+        print(f"📊 Total productos: {len(all_products)}")
+        
+        # Agrupar productos similares por hash de imagen
+        groups = defaultdict(list)
+        for product in all_products:
+            groups[product['image_hash']].append(product)
+        
+        print(f"🔗 Grupos formados: {len(groups)}")
+        
+        # Consolidar: elegir el mejor precio de cada grupo
         consolidated = []
-        for idx, group in enumerate(groups):
-            best_price = min(group, key=lambda x: x['priceCaja'])
-            best_moq = min(group, key=lambda x: x['moq'])
-            best_desc = max(group, key=lambda x: len(x['description']))
-            best_img = max(group, key=lambda x: len(x.get('image', '')) if x.get('image') else 0)
+        for hash_key, group in groups.items():
+            # Ordenar por precio de caja (menor precio primero)
+            group_sorted = sorted(group, key=lambda x: x['priceCaja'])
+            best = group_sorted[0]
             
+            # Calcular ahorro
             prices = [p['priceCaja'] for p in group]
             max_price = max(prices)
-            savings = max_price - best_price['priceCaja']
+            savings = round(max_price - best['priceCaja'], 2)
             
             consolidated_product = {
-                'consolidated_sku': f'CONS-{str(idx+1).zfill(4)}',
-                'description': best_desc['description'],
-                'priceCaja': best_price['priceCaja'],
-                'priceMenudeo': best_price['priceMenudeo'],
-                'moq': best_moq['moq'],
-                'category': best_desc['category'],
-                'provider': best_price['provider'],
+                'consolidated_sku': f"CONS-{str(len(consolidated) + 1).zfill(4)}",
+                'description': best['description'],
+                'priceMenudeo': best['priceMenudeo'],
+                'priceCaja': best['priceCaja'],
+                'moq': best['moq'],
+                'category': best['category'],
+                'provider': best['provider'],
                 'num_providers': len(group),
-                'savings': round(savings, 2),
-                'savingsPercent': round((savings / max_price * 100) if max_price > 0 else 0, 1),
-                'image': best_img.get('image'),
+                'savings': savings,
                 'alternatives': [
                     {
                         'provider': p['provider'],
                         'sku': p['sku'],
                         'priceCaja': p['priceCaja']
                     }
-                    for p in sorted(group, key=lambda x: x['priceCaja'])
+                    for p in group
                 ]
             }
             
@@ -188,6 +313,8 @@ def process_catalogs():
             'avgProviders': round(sum(p['num_providers'] for p in consolidated) / len(consolidated), 1) if consolidated else 0
         }
         
+        print(f"✅ Consolidación completa: {stats['totalProducts']} productos únicos")
+        
         return jsonify({
             'success': True,
             'consolidated': consolidated,
@@ -195,7 +322,7 @@ def process_catalogs():
         })
         
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"❌ Error: {str(e)}")
         import traceback
         traceback.print_exc()
         return jsonify({
