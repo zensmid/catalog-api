@@ -26,12 +26,17 @@ def resize_image(image, max_size=MAX_IMAGE_SIZE):
 
 def extract_from_pdf(pdf_file):
     """
-    Extrae productos de un catálogo PDF con estructura de tabla
-    Formato esperado:
-    PRODUCTO | FOTO | MODELO | MAYOREO | MITAD CAJA | POR CAJA | CANTIDAD
+    Extrae productos de un catálogo PDF asociando imágenes con texto cercano
     """
     products = []
     pdf_document = None
+    
+    # Palabras clave que indican que NO es un producto
+    HEADER_KEYWORDS = [
+        'PRODUCTO', 'FOTO', 'MODELO', 'MAYOREO', 'MITAD', 'CAJA', 'CANTIDAD',
+        'DESCRIPCION', 'DESCRIPCIÓN', 'PRECIO', 'MOQ', 'SKU', 'CODIGO',
+        'CATEGORIA', 'DISPONIBILIDAD', 'PZAS', 'MENUDEO', 'LISTA', 'CODIGO DE PRODUCTO'
+    ]
     
     try:
         # Leer el PDF en memoria
@@ -44,108 +49,139 @@ def extract_from_pdf(pdf_file):
         for page_num in range(total_pages):
             page = pdf_document[page_num]
             
-            # Extraer texto completo de la página
-            text = page.get_text()
-            lines = [l.strip() for l in text.split('\n') if l.strip()]
-            
-            # Extraer imágenes de la página
+            # Extraer imágenes con sus posiciones
             image_list = page.get_images(full=True)
             
-            print(f"📄 Página {page_num + 1}/{total_pages}: {len(image_list)} imágenes, {len(lines)} líneas")
+            if not image_list:
+                print(f"📄 Página {page_num + 1}: Sin imágenes, saltando...")
+                continue
             
-            # Buscar filas de productos
-            i = 0
-            while i < len(lines):
-                line = lines[i]
-                
-                # Detectar inicio de producto (descripción en mayúsculas o con palabras clave)
-                if len(line) > 5 and (line.isupper() or any(word in line.upper() for word in ['GORRO', 'SET', 'BOLSA', 'IMPERMEABLE', 'TIRA', 'LUCES', 'ESTRELLITAS', 'NAVIDAD', 'AMARILLA'])):
-                    description = line
+            # Extraer texto con posiciones (bloques)
+            blocks = page.get_text("blocks")
+            
+            print(f"📄 Página {page_num + 1}/{total_pages}: {len(image_list)} imágenes")
+            
+            # Para cada imagen, buscar texto cercano
+            for img_index, img in enumerate(image_list):
+                try:
+                    # Extraer la imagen
+                    xref = img[0]
+                    base_image = pdf_document.extract_image(xref)
+                    image_bytes = base_image["image"]
                     
-                    # Buscar los siguientes datos en las próximas 10 líneas
+                    # Convertir a PIL Image
+                    image = Image.open(io.BytesIO(image_bytes))
+                    
+                    # Optimizar imagen
+                    image = resize_image(image)
+                    if image.mode not in ('RGB', 'L'):
+                        image = image.convert('RGB')
+                    
+                    # Calcular hash
+                    img_hash = str(imagehash.phash(image, hash_size=HASH_SIZE))
+                    
+                    # Obtener posición de la imagen en la página
+                    img_rect = page.get_image_bbox(img)
+                    img_y = (img_rect.y0 + img_rect.y1) / 2  # Centro vertical de la imagen
+                    
+                    # Buscar texto en la misma fila (±50 puntos de diferencia)
+                    row_texts = []
+                    row_numbers = []
+                    
+                    for block in blocks:
+                        if len(block) < 5:
+                            continue
+                        
+                        x0, y0, x1, y1, text = block[0], block[1], block[2], block[3], block[4]
+                        block_y = (y0 + y1) / 2
+                        
+                        # Si está en la misma fila que la imagen
+                        if abs(block_y - img_y) < 50:
+                            text_clean = text.strip()
+                            
+                            # Ignorar cabeceras
+                            if any(keyword in text_clean.upper() for keyword in HEADER_KEYWORDS):
+                                continue
+                            
+                            # Guardar texto
+                            if len(text_clean) > 2:
+                                row_texts.append(text_clean)
+                            
+                            # Buscar números (precios)
+                            numbers = re.findall(r'\b(\d{2,4})\b', text_clean)
+                            for num_str in numbers:
+                                num = int(num_str)
+                                if 10 <= num <= 5000:
+                                    row_numbers.append(num)
+                    
+                    # Buscar descripción (texto más largo que no sea número)
+                    description = None
+                    for text in row_texts:
+                        # Ignorar si es solo números
+                        if text.replace(' ', '').replace('-', '').isdigit():
+                            continue
+                        # Ignorar si es muy corto
+                        if len(text) < 5:
+                            continue
+                        # Tomar el texto más largo
+                        if not description or len(text) > len(description):
+                            description = text
+                    
+                    if not description:
+                        description = f"Producto {img_index + 1}"
+                    
+                    # Buscar SKU (texto corto alfanumérico)
                     sku = None
-                    prices = []
-                    moq = 100
+                    for text in row_texts:
+                        if 2 <= len(text) <= 10 and text.replace('-', '').replace('_', '').isalnum():
+                            # No usar la descripción como SKU
+                            if text != description:
+                                sku = text
+                                break
                     
-                    # Buscar en las siguientes líneas
-                    for j in range(i + 1, min(i + 10, len(lines))):
-                        next_line = lines[j].strip()
-                        
-                        # Buscar SKU/Modelo (números o combinaciones alfanuméricas cortas)
-                        if not sku and len(next_line) <= 10 and (next_line.replace('-', '').replace('_', '').isalnum()):
-                            if not next_line.replace(' ', '').isdigit() or len(next_line) <= 4:
-                                sku = next_line
-                        
-                        # Buscar números que sean precios (números entre 10 y 10000)
-                        numbers = re.findall(r'\b(\d{2,5})\b', next_line)
-                        for num_str in numbers:
-                            num = int(num_str)
-                            if 10 <= num <= 10000:
-                                prices.append(num)
-                        
-                        # Buscar MOQ (cantidad)
-                        if 'PIEZA' in next_line.upper() or 'DOCENA' in next_line.upper() or 'CAJITA' in next_line.upper():
-                            moq_match = re.search(r'(\d+)\s*(?:PIEZA|DOCENA|CAJITA)', next_line, re.IGNORECASE)
-                            if moq_match:
-                                moq = int(moq_match.group(1))
-                        
-                        # Si llegamos a otro producto, parar
-                        if j > i + 2 and len(next_line) > 20 and next_line.isupper():
-                            break
-                    
-                    # Asignar SKU si no se encontró
                     if not sku:
-                        sku = f"PROD-{page_num+1}-{len(products)+1}"
+                        sku = f"PROD-{page_num+1}-{img_index+1}"
                     
-                    # Asignar precios (ordenar de menor a mayor)
-                    if len(prices) >= 3:
-                        prices_sorted = sorted(set(prices))[:3]
+                    # Procesar precios
+                    if len(row_numbers) >= 3:
+                        prices_sorted = sorted(set(row_numbers))[:3]
                         price_mayoreo = prices_sorted[0]
-                        price_mitad = prices_sorted[1] if len(prices_sorted) > 1 else prices_sorted[0]
-                        price_caja = prices_sorted[2] if len(prices_sorted) > 2 else prices_sorted[0]
-                    elif len(prices) >= 2:
-                        prices_sorted = sorted(set(prices))
+                        price_mitad = prices_sorted[1]
+                        price_caja = prices_sorted[2]
+                    elif len(row_numbers) == 2:
+                        prices_sorted = sorted(set(row_numbers))
                         price_mayoreo = prices_sorted[0]
                         price_mitad = prices_sorted[1]
                         price_caja = prices_sorted[1]
-                    elif len(prices) == 1:
-                        price_mayoreo = prices[0]
-                        price_mitad = prices[0]
-                        price_caja = prices[0]
+                    elif len(row_numbers) == 1:
+                        price_mayoreo = row_numbers[0]
+                        price_mitad = row_numbers[0]
+                        price_caja = row_numbers[0]
                     else:
-                        price_mayoreo = 50
-                        price_mitad = 50
-                        price_caja = 50
+                        # Si no hay precios, saltar este producto
+                        print(f"⚠️ Imagen {img_index+1}: Sin precios, saltando")
+                        continue
+                    
+                    # Buscar MOQ
+                    moq = 100
+                    for text in row_texts:
+                        if 'PIEZA' in text.upper() or 'DOCENA' in text.upper():
+                            moq_match = re.search(r'(\d+)\s*(?:PIEZA|DOCENA|CAJITA)', text, re.IGNORECASE)
+                            if moq_match:
+                                moq = int(moq_match.group(1))
+                                break
                     
                     # Detectar categoría
                     category = 'GENERAL'
                     desc_lower = description.lower()
-                    if any(word in desc_lower for word in ['gorro', 'bufanda', 'caballero', 'dama', 'niño', 'niña']):
+                    if any(word in desc_lower for word in ['gorro', 'bufanda', 'caballero', 'dama', 'niño', 'niña', 'sombrero']):
                         category = 'ROPA Y ACCESORIOS'
-                    elif any(word in desc_lower for word in ['navidad', 'luces', 'estrellitas', 'decoracion']):
+                    elif any(word in desc_lower for word in ['navidad', 'luces', 'estrellitas', 'decoracion', 'regalo']):
                         category = 'DECORACION'
-                    elif any(word in desc_lower for word in ['bolsa', 'regalo', 'empaque']):
+                    elif any(word in desc_lower for word in ['bolsa', 'empaque', 'papel']):
                         category = 'EMPAQUES Y REGALOS'
-                    elif any(word in desc_lower for word in ['impermeable', 'tira', 'led']):
+                    elif any(word in desc_lower for word in ['impermeable', 'tira', 'led', 'usb']):
                         category = 'ELECTRONICA'
-                    
-                    # Calcular hash de imagen si existe
-                    img_hash = None
-                    if len(products) < len(image_list):
-                        try:
-                            img = image_list[len(products)]
-                            xref = img[0]
-                            base_image = pdf_document.extract_image(xref)
-                            image_bytes = base_image["image"]
-                            image = Image.open(io.BytesIO(image_bytes))
-                            image = resize_image(image)
-                            if image.mode not in ('RGB', 'L'):
-                                image = image.convert('RGB')
-                            img_hash = str(imagehash.phash(image, hash_size=HASH_SIZE))
-                            del image
-                            del image_bytes
-                        except:
-                            pass
                     
                     product = {
                         'sku': sku,
@@ -158,11 +194,17 @@ def extract_from_pdf(pdf_file):
                     }
                     
                     products.append(product)
-                    print(f"✅ Producto: {description[:30]}... | SKU: {sku} | Precios: {price_mayoreo}/{price_mitad}/{price_caja} | MOQ: {moq}")
-                
-                i += 1
+                    print(f"✅ {description[:40]} | SKU: {sku} | Precios: {price_mayoreo}/{price_mitad}/{price_caja} | MOQ: {moq}")
+                    
+                    # Limpiar memoria
+                    del image
+                    del image_bytes
+                    
+                except Exception as e:
+                    print(f"❌ Error en imagen {img_index+1}: {e}")
+                    continue
             
-            # **OPTIMIZACIÓN: Liberar memoria**
+            # Limpiar memoria
             del page
             if page_num % 5 == 0:
                 gc.collect()
@@ -176,7 +218,7 @@ def extract_from_pdf(pdf_file):
             pdf_document.close()
         gc.collect()
     
-    print(f"📦 Total productos extraídos del PDF: {len(products)}")
+    print(f"📦 Total productos extraídos: {len(products)}")
     return products
 
 def extract_from_excel(excel_file):
