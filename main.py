@@ -6,7 +6,6 @@ import imagehash
 import io
 import re
 import fitz  # PyMuPDF
-import pytesseract
 from collections import defaultdict
 
 app = Flask(__name__)
@@ -15,24 +14,33 @@ CORS(app)
 # Función para extraer imágenes y texto de PDF
 def extract_from_pdf(pdf_file):
     """
-    Extrae imágenes y texto de un PDF
-    Retorna lista de productos con imágenes
+    Extrae imágenes y texto de un PDF usando solo PyMuPDF
+    NO requiere Tesseract OCR
     """
     products = []
     
     # Abrir PDF
     pdf_document = fitz.open(stream=pdf_file.read(), filetype="pdf")
     
+    print(f"📄 PDF con {len(pdf_document)} páginas")
+    
     for page_num in range(len(pdf_document)):
         page = pdf_document[page_num]
         
-        # Extraer texto de la página
+        # Extraer TODO el texto de la página
         text = page.get_text()
         
         # Extraer imágenes de la página
         image_list = page.get_images(full=True)
         
-        print(f"📄 Página {page_num + 1}: {len(image_list)} imágenes encontradas")
+        print(f"📄 Página {page_num + 1}: {len(image_list)} imágenes, {len(text)} caracteres de texto")
+        
+        # Si no hay imágenes en esta página, siguiente
+        if not image_list:
+            continue
+        
+        # Dividir texto en líneas
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
         
         for img_index, img in enumerate(image_list):
             try:
@@ -46,85 +54,88 @@ def extract_from_pdf(pdf_file):
                 # Calcular hash de la imagen
                 img_hash = str(imagehash.phash(image))
                 
-                # Intentar extraer info del texto cercano
-                # Buscar patrones comunes en catálogos
+                # BUSCAR DATOS EN EL TEXTO DE LA PÁGINA
                 
-                # Patrón para SKU (ejemplos: SKU123, ABC-123, 12345)
-                sku_pattern = r'(?:SKU[:\s]*)?([A-Z0-9\-]{4,15})'
+                # Patrones
+                sku_pattern = r'(?:SKU[:\s]*)?([A-Z0-9\-]{3,20})'
+                price_pattern = r'\$?\s*(\d{1,5}\.?\d{0,2})'
                 
-                # Patrón para precios (ejemplos: $123.45, $123, 123.45)
-                price_pattern = r'\$?\s*(\d+\.?\d{0,2})'
-                
-                # Patrón para descripción (texto antes del precio generalmente)
-                lines = text.split('\n')
-                
-                # Buscar datos en el contexto de la imagen
+                # Variables
                 sku = f"PDF-{page_num+1}-{img_index+1}"
-                description = f"Producto {page_num+1}-{img_index+1}"
+                description = "Producto sin descripción"
                 prices = []
                 
-                for line in lines:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    
+                # Buscar en cada línea
+                for i, line in enumerate(lines):
                     # Buscar SKUs
-                    sku_match = re.search(sku_pattern, line, re.IGNORECASE)
-                    if sku_match and len(sku) < 10:  # Solo si aún no tenemos un SKU bueno
-                        sku = sku_match.group(1)
+                    sku_matches = re.findall(sku_pattern, line, re.IGNORECASE)
+                    if sku_matches:
+                        for match in sku_matches:
+                            if len(match) >= 4 and len(match) <= 15:
+                                sku = match
+                                break
                     
                     # Buscar precios
                     price_matches = re.findall(price_pattern, line)
                     for match in price_matches:
                         try:
-                            price = float(match)
-                            if 1 <= price <= 10000:  # Filtrar precios razonables
+                            price = float(match.replace(',', ''))
+                            # Filtrar precios razonables (entre $1 y $10,000)
+                            if 1 <= price <= 10000:
                                 prices.append(price)
                         except:
                             pass
                     
-                    # Si la línea tiene 20-100 caracteres, podría ser descripción
-                    if 20 <= len(line) <= 100 and not any(c in line for c in ['$', '€', '£']):
-                        description = line[:80]  # Limitar longitud
+                    # Buscar descripción (líneas con 15-100 caracteres, sin símbolos de precio)
+                    if 15 <= len(line) <= 100:
+                        # No debe tener símbolos de precio
+                        if not any(c in line for c in ['$', '€', '£', '¢']):
+                            # No debe ser solo números
+                            if not line.replace('-', '').replace(' ', '').isdigit():
+                                description = line[:80]
                 
-                # Si no encontramos precios, intentar OCR en la imagen
-                if not prices:
-                    try:
-                        ocr_text = pytesseract.image_to_string(image, lang='spa')
-                        ocr_prices = re.findall(price_pattern, ocr_text)
-                        for match in ocr_prices:
-                            try:
-                                price = float(match)
-                                if 1 <= price <= 10000:
-                                    prices.append(price)
-                            except:
-                                pass
-                    except Exception as e:
-                        print(f"⚠️ OCR error: {e}")
+                # Asignar precios (el más bajo = menudeo, siguiente = caja)
+                if prices:
+                    prices_sorted = sorted(set(prices))  # Eliminar duplicados y ordenar
+                    price_menudeo = prices_sorted[0]
+                    price_caja = prices_sorted[1] if len(prices_sorted) > 1 else price_menudeo * 0.85
+                else:
+                    # Precios por defecto si no se encontraron
+                    price_menudeo = 50.00
+                    price_caja = 42.50
                 
-                # Usar el precio más bajo como precio de menudeo, siguiente como caja
-                price_menudeo = min(prices) if prices else 50.00
-                price_caja = prices[1] if len(prices) > 1 else price_menudeo * 0.8
+                # Intentar detectar categoría del texto
+                category = 'GENERAL'
+                text_lower = text.lower()
+                if any(word in text_lower for word in ['electronic', 'electrónic', 'gadget', 'usb', 'cable']):
+                    category = 'ELECTRONICA'
+                elif any(word in text_lower for word in ['accesorio', 'accessory', 'soporte', 'funda']):
+                    category = 'ACCESORIOS'
+                elif any(word in text_lower for word in ['hogar', 'home', 'cocina', 'kitchen']):
+                    category = 'HOGAR'
+                elif any(word in text_lower for word in ['deporte', 'sport', 'fitness', 'ejercicio']):
+                    category = 'DEPORTES'
                 
                 product = {
                     'sku': sku,
                     'description': description,
                     'priceMenudeo': round(price_menudeo, 2),
                     'priceCaja': round(price_caja, 2),
-                    'moq': 100,  # Default
-                    'category': 'GENERAL',  # Default
+                    'moq': 100,
+                    'category': category,
                     'image_hash': img_hash,
                     'image': image
                 }
                 
                 products.append(product)
-                print(f"✓ Producto extraído: {sku} - ${price_menudeo}")
+                print(f"✓ Extraído: {sku} - {description[:30]} - ${price_menudeo}")
                 
             except Exception as e:
                 print(f"❌ Error extrayendo imagen {img_index}: {e}")
                 continue
     
     pdf_document.close()
+    print(f"📦 Total productos del PDF: {len(products)}")
     return products
 
 # Función para procesar archivos Excel (mantener compatibilidad)
@@ -133,7 +144,6 @@ def extract_from_excel(excel_file):
     Mantiene la funcionalidad original de Excel
     """
     from openpyxl import load_workbook
-    from openpyxl.drawing.image import Image as XLImage
     
     products = []
     
@@ -148,20 +158,25 @@ def extract_from_excel(excel_file):
         for idx, header in enumerate(headers, 1):
             if header:
                 h = str(header).lower()
-                if 'sku' in h or 'codigo' in h:
+                if 'sku' in h or 'codigo' in h or 'clave' in h:
                     col_mapping['sku'] = idx
-                elif 'descripcion' in h or 'producto' in h or 'nombre' in h:
+                elif 'descripcion' in h or 'producto' in h or 'nombre' in h or 'description' in h:
                     col_mapping['description'] = idx
-                elif 'menudeo' in h or 'precio' in h:
+                elif 'menudeo' in h or 'retail' in h:
                     col_mapping['price'] = idx
-                elif 'caja' in h or 'mayoreo' in h:
+                elif 'precio' in h and 'price' not in col_mapping:
+                    col_mapping['price'] = idx
+                elif 'caja' in h or 'mayoreo' in h or 'wholesale' in h:
                     col_mapping['priceCaja'] = idx
-                elif 'moq' in h or 'minimo' in h:
+                elif 'moq' in h or 'minimo' in h or 'minimum' in h:
                     col_mapping['moq'] = idx
                 elif 'categoria' in h or 'category' in h:
                     col_mapping['category'] = idx
         
+        print(f"📊 Columnas detectadas: {col_mapping}")
+        
         # Extraer imágenes
+        image_count = 0
         for image in sheet._images:
             try:
                 row = image.anchor._from.row + 1
@@ -170,7 +185,12 @@ def extract_from_excel(excel_file):
                 sku = sheet.cell(row, col_mapping.get('sku', 1)).value or f"XLS-{row}"
                 description = sheet.cell(row, col_mapping.get('description', 2)).value or "Producto sin descripción"
                 price = sheet.cell(row, col_mapping.get('price', 3)).value or 50.00
-                price_caja = sheet.cell(row, col_mapping.get('priceCaja', 4)).value or price * 0.8
+                price_caja = sheet.cell(row, col_mapping.get('priceCaja', 4)).value
+                
+                # Si no hay precio de caja, calcularlo
+                if not price_caja:
+                    price_caja = float(price) * 0.85
+                
                 moq = sheet.cell(row, col_mapping.get('moq', 5)).value or 100
                 category = sheet.cell(row, col_mapping.get('category', 6)).value or "GENERAL"
                 
@@ -191,22 +211,26 @@ def extract_from_excel(excel_file):
                 }
                 
                 products.append(product)
-                print(f"✓ Excel: {sku} - ${price}")
+                image_count += 1
+                print(f"✓ Excel fila {row}: {sku} - ${price}")
                 
             except Exception as e:
-                print(f"❌ Error en imagen Excel: {e}")
+                print(f"❌ Error en imagen Excel fila {row}: {e}")
                 continue
         
         wb.close()
+        print(f"📦 Total productos del Excel: {image_count}")
         
     except Exception as e:
         print(f"❌ Error leyendo Excel: {e}")
+        import traceback
+        traceback.print_exc()
     
     return products
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'healthy', 'message': 'API funcionando correctamente'}), 200
+    return jsonify({'status': 'healthy', 'message': 'API funcionando - PDF y Excel'}), 200
 
 @app.route('/api/consolidate', methods=['POST'])
 def consolidate_catalogs():
