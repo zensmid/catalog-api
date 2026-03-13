@@ -1,0 +1,48 @@
+{
+  "mcpServers": {
+    "google-sheets": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-google-sheets"],
+      "env": {
+        "GOOGLE_SHEETS_SPREADSHEET_ID": "1rP5O1KN8gy-RHZ4AcPSvzjeG9Pllf7QiKtVZYIATM8c",
+        "GOOGLE_OAUTH_CLIENT_ID": "${GOOGLE_OAUTH_CLIENT_ID}",
+        "GOOGLE_OAUTH_CLIENT_SECRET": "${GOOGLE_OAUTH_CLIENT_SECRET}",
+        "GOOGLE_OAUTH_REFRESH_TOKEN": "${GOOGLE_OAUTH_REFRESH_TOKEN}"
+      }
+    },
+    "gmail": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-gmail"],
+      "env": {
+        "GOOGLE_OAUTH_CLIENT_ID": "${GOOGLE_OAUTH_CLIENT_ID}",
+        "GOOGLE_OAUTH_CLIENT_SECRET": "${GOOGLE_OAUTH_CLIENT_SECRET}",
+        "GOOGLE_OAUTH_REFRESH_TOKEN": "${GOOGLE_OAUTH_REFRESH_TOKEN}"
+      }
+    },
+    "netlify": {
+      "command": "npx",
+      "args": ["-y", "@netlify/mcp"],
+      "env": {
+        "NETLIFY_AUTH_TOKEN": "${NETLIFY_AUTH_TOKEN}",
+        "NETLIFY_SITE_ID_CLIENTE": "bright-fenglisu-7912bc",
+        "NETLIFY_SITE_ID_ADMIN": "cozy-halva-68ce78"
+      }
+    },
+    "whatsapp": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-whatsapp"],
+      "env": {
+        "WHATSAPP_BUSINESS_PHONE": "+525659400410",
+        "WHATSAPP_ACCESS_TOKEN": "${WHATSAPP_ACCESS_TOKEN}",
+        "WHATSAPP_PHONE_NUMBER_ID": "${WHATSAPP_PHONE_NUMBER_ID}"
+      }
+    },
+    "17track": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-17track"],
+      "env": {
+        "TRACK17_API_KEY": "BADA1144C67775A66A6467AAF777FDA2"
+      }
+    }
+  }
+}

@@ -1,0 +1,53 @@
+[build]
+  command = "npm run build"
+  publish = ".next"
+  functions = "netlify/functions"
+
+[build.environment]
+  NEXT_TELEMETRY_DISABLED = "1"
+  NODE_VERSION = "20"
+
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
+
+# ─── Scheduled Functions ──────────────────────────────────────────────────────
+
+[functions."scheduled-daily-report"]
+  schedule = "0 9 * * *"
+
+[functions."sync-17track"]
+  schedule = "0 * * * *"
+
+[functions."backup-to-sheets"]
+  schedule = "0 */6 * * *"
+
+[functions."generate-analytics"]
+  schedule = "0 */6 * * *"
+
+# ─── Redirects ────────────────────────────────────────────────────────────────
+
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/:splat"
+  status = 200
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# ─── Headers ──────────────────────────────────────────────────────────────────
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+
+[[headers]]
+  for = "/api/*"
+  [headers.values]
+    Access-Control-Allow-Origin = "*"
+    Access-Control-Allow-Methods = "GET, POST, PUT, DELETE, OPTIONS"
+    Access-Control-Allow-Headers = "Content-Type, Authorization"
